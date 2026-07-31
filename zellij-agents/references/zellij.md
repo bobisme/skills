@@ -38,11 +38,29 @@ zellij action new-pane --name guest --cwd /path -- /bin/bash -lc 'exec codex'
 ```
 
 `new-pane` prints the created pane id on stdout — that is the handle for
-everything after.
+everything after. Useful flags: `--floating` (does not disturb the tiled layout),
+`--close-on-exit`, `--in-place`.
 
-Useful flags: `--floating` (does not disturb the tiled layout), `--close-on-exit`,
-`--in-place`. `new-tab` also accepts a command but returns a *tab* id, not a pane
-id, so it needs a `list-panes` lookup afterwards.
+### Placement: tab, split, or stacked
+
+Prefer **one tab per guest**. A tab gets the session's full geometry, so guests
+do not shrink as more are added. Measured in a 200x50 session: two guests split
+into one tab were 100x24 each, while the same guests in their own tabs were
+200x48 each.
+
+```bash
+tab=$(zellij action new-tab --name guest-codex --cwd /path -- /bin/bash -lc 'exec codex')
+# prints a TAB id, NOT a pane id
+```
+
+The tab's initial pane runs the command, but the pane id has to be looked up.
+**Use `list-panes -j` for that, not the table**: tab names contain spaces
+(`Tab #1`), so splitting the table on whitespace misaligns every column after it.
+The JSON is a flat list of pane objects with `id`, `is_plugin`, `is_floating` and
+`tab_id`; the guest is the non-plugin, non-floating pane whose `tab_id` matches.
+
+**Never use `--stacked` for a guest.** A collapsed pane in a stack is allocated
+**one row** — verified — so the TUI reflows to a single line and is useless.
 
 Wrapping in `/bin/bash -lc 'exec …'` gets the guest a login shell's environment.
 `exec` matters: it keeps the pane's process *being* the agent, so
@@ -125,24 +143,66 @@ Auto-approval flags trade safety for not blocking. Only use them with the user's
 agreement, and never in a directory whose contents are untrusted — the guest is
 reading files that can contain instructions aimed at it.
 
-## Background sessions
+## The guest session
+
+Guests belong in their own session (`agents` by default), never in the caller's.
+`zagent.py ensure_session()` implements the lifecycle:
 
 ```bash
+zellij list-sessions -n                   # parseable; marks "(EXITED - …)"
 zellij attach -b NAME                     # create detached
+zellij -s NAME action list-clients        # header only => nobody attached
 zellij -s NAME action …                   # drive it
 zellij delete-session NAME --force        # tear down
 ```
 
+Three states worth distinguishing, because they need different handling:
+
+| state | how to tell | what to do |
+|---|---|---|
+| missing | absent from `list-sessions` | create, with a sized client |
+| exited | line contains `EXITED` | `delete-session --force`, then create; resurrecting revives a layout nobody asked for, and its panes are dead placeholders |
+| alive, unattached | `list-clients` prints only a header | attach a sized client — it is 50x50 until then |
+
 A detached session has **no client, so zellij gives it a 50x50 default**. Split
 between two panes that is ~25 columns, at which agent TUIs reflow into
-unreadable soup — verified. Attach a correctly sized pty client first:
+unreadable soup — verified. Attach a pty client:
 
 ```bash
-python3 scripts/zj_headless.py NAME 200 50 &
+python3 scripts/zj_headless.py NAME &        # defaults to 500x150
 ```
 
 The pty must be drained continuously or it fills and the zellij client blocks,
-freezing every pane in the session. `zj_headless.py` does this.
+freezing every pane in the session. `zj_headless.py` does this, and must outlive
+the process that started it (`start_new_session=True`).
+
+### Sizing, and why the headless client is oversized
+
+**Zellij sizes a session to its smallest attached client** — the same rule tmux
+uses by default. Measured: a 200x50 client plus a 100x30 client yields 100x28
+panes.
+
+That makes the headless client a *ceiling* on what a human sees. At 200x50, a
+user attaching from a wider terminal stays boxed at 200 columns and the session
+appears not to resize. Defaulting it to **500x150**, larger than any real
+terminal, means a real client is always the smaller one, so the session fits
+itself to whoever attaches.
+
+Verified cycle, with a live codex in the session throughout:
+
+| event | pane geometry |
+|---|---|
+| headless client only | 500x148 |
+| human attaches at 130x34 | 130x32 |
+| human detaches | 500x148 |
+
+The guest TUI reflows correctly in both directions, keeps its scrollback, and
+keeps answering prompts. Raising the default further costs grid memory per pane
+(cols x rows x styled cell) for no practical gain.
+
+**A session keeps its last size when every client leaves.** The 50x50 default
+applies only to a session that has never had one, so a session that was attached
+once does not collapse afterwards.
 
 Deleting the session kills every guest in it; quit them first if their state
 matters.

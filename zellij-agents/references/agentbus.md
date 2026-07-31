@@ -48,13 +48,27 @@ unchanged mtime does not mean the observer is dead.
 }]}
 ```
 
+**The location field was renamed.** Current agentbus publishes
+
+```json
+"location": {"mux": "zellij", "session": "agents", "pane": "4"}
+```
+
+where older versions published `"pane": {"zellij_session": …, "pane_id": …}`.
+`mux` exists because agentbus now recognises tmux, wezterm and kitty too, so a
+subscriber must check it rather than assume zellij. `zagent.py location_of()`
+reads both shapes; a consumer that reads only the old one silently binds nothing
+and every wait reports `no_uptake`.
+
+Sessions also now carry `state_since`, `tools` and `effort`.
+
 Notes that matter:
 
-- `pane_id` is the **bare number** (`"1"`), while zellij's CLI wants
-  `terminal_1`. Convert in both directions.
-- `pane` is empty until a hook has reported the binding, and is cleared again as
-  soon as the owning process dies — so an empty `pane` means "not currently in a
-  known pane", not "unknown forever".
+- `pane` is the **bare number** (`"4"`), while zellij's CLI wants `terminal_4`.
+  Convert in both directions.
+- It is empty until a hook has reported the binding, and is cleared again as
+  soon as the owning process dies — so empty means "not currently in a known
+  pane", not "unknown forever".
 - **There is deliberately no `done` state.** A finished agent is `idle`. The
   distinction between "finished your work" and "waiting for your next prompt"
   does not exist at this layer; it is recovered by watching the *transition*.
@@ -95,20 +109,30 @@ One JSON object per line: `ts`, `source`, `session`, `kind`, plus per-kind field
 turn-end record. Treating that restatement as a new turn pins a session to
 "working" forever. **Never derive turn start from `label`.**
 
-## Per-agent differences (the important part)
+## Per-agent differences
 
-|  | codex | claude |
+Current agentbus gives both agents the same shape: `prompt` opens a turn,
+`turn_end` closes it carrying the answer.
+
+Against an **older agentbus** they diverged, and the divergence broke naive
+consumers:
+
+|  | codex | claude (old) |
 |---|---|---|
 | emits `prompt` | yes | **no** |
-| emits `turn_end` | yes | yes |
 | `turn_end.result` | the answer text | **always null** |
 | turn start visible as | `prompt` | `reported state=working` (hook) |
-| result lives in | the event | the transcript |
 
-A wait loop gated on `prompt` therefore **hangs forever on a Claude guest** — a
-real failure observed in testing, where Claude answered in ~1s and the loop still
-timed out at 120s. Gate on the snapshot's normalised `state` instead; it folds
-`reported`, `prompt`, `tool` and `turn_end` into one `working`/`idle` machine.
+A wait loop gated on `prompt` **hung forever on a Claude guest** — observed in
+testing, where Claude answered in ~1s and the loop still timed out at 120s.
+
+Gate on the snapshot's normalised `state` regardless. It costs nothing, works on
+both versions, and folds in the `reported` states from hooks — the only source
+that ever says `blocked`.
+
+**Never truncate a session id to compare or display it.** Codex uses UUIDv7, so
+the leading characters are a creation timestamp: two guests started seconds apart
+share a long prefix and look identical when shortened.
 
 ## Extracting a result
 

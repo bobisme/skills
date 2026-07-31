@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Drive another coding agent's TUI in a zellij pane.
 
+Guests live in a dedicated zellij session, "agents" by default, which is created
+on demand. They never land in whatever session the caller happens to be in:
+spawning panes into the user's working session rearranges their layout without
+being asked.
+
 Completion detection comes from agentbus, which normalises every agent's
 transcript into one state machine. Screen scraping is only a fallback.
 
@@ -8,8 +13,11 @@ transcript into one state machine. Screen scraping is only a fallback.
     zagent.py ask 6 "fix the failing test"       -> blocks, prints result JSON
     zagent.py send 6 "..." ; zagent.py wait 6    -> same, split apart
     zagent.py read 6                             -> current screen
-    zagent.py status                             -> every agent agentbus can see
+    zagent.py status                             -> agents in the session
     zagent.py kill 6                             -> graceful quit, then close
+
+Override the session with --session/-s or $ZAGENT_SESSION. Passing -s '' targets
+the caller's current session, which is rarely what is wanted.
 """
 
 import argparse
@@ -23,6 +31,16 @@ SNAPSHOT = None  # resolved lazily; zellij's runtime dir is uid-scoped
 STATE = os.path.expanduser(
     os.environ.get("AGENTBUS_STATE", "~/.local/state/agentbus")
 )
+
+# Guests get their own session so they never disturb the user's layout.
+DEFAULT_SESSION = os.environ.get("ZAGENT_SESSION", "agents")
+# A session with no attached client is 50x50, which reflows agent TUIs into
+# unreadable ~25-column panes, so a headless client is attached to give it a
+# size. Zellij sizes a session to its *smallest* attached client, so this is
+# deliberately larger than any real terminal: whenever a human attaches, their
+# terminal is the smaller one and the session fits itself to them, the way tmux
+# behaves. Shrinking this would cap what the human sees.
+DEFAULT_COLS, DEFAULT_ROWS = 500, 150
 EVENTS = os.path.join(STATE, "events.jsonl")
 REGISTER = os.path.join(STATE, "register.jsonl")
 
@@ -76,6 +94,97 @@ def zj(session, *args, check=False):
     return r.stdout.strip()
 
 
+def list_sessions():
+    """Map session name -> "live" | "exited"."""
+    r = subprocess.run(
+        ["zellij", "list-sessions", "-n"], capture_output=True, text=True
+    )
+    out = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.split()[0]
+        out[name] = "exited" if "EXITED" in line else "live"
+    return out
+
+
+def has_client(session):
+    """True when a client is attached, so the session has a usable size."""
+    r = subprocess.run(
+        ["zellij", "-s", session, "action", "list-clients"],
+        capture_output=True,
+        text=True,
+    )
+    rows = [l for l in r.stdout.splitlines()[1:] if l.strip()]
+    return bool(rows)
+
+
+def attach_headless(session, cols, rows, timeout=20.0):
+    """Start a detached, correctly sized pty client and wait for it to land."""
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "zj_headless.py")
+    if not os.path.exists(helper):
+        raise SystemExit(f"missing helper: {helper}")
+    subprocess.Popen(
+        [sys.executable, helper, session, str(cols), str(rows)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # survives this process exiting
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if list_sessions().get(session) == "live" and has_client(session):
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def ensure_session(session, cols=DEFAULT_COLS, rows=DEFAULT_ROWS):
+    """Guarantee `session` exists and is usable. Returns what had to be done.
+
+    An empty session name means "the caller's current session"; nothing to set
+    up, and nothing that should be created behind the user's back.
+    """
+    if not session:
+        return {"session": None, "action": "current"}
+
+    state = list_sessions().get(session)
+    if state == "exited":
+        # Resurrectable, but its panes are dead placeholders and attaching
+        # revives a layout nobody asked for. Start clean instead.
+        subprocess.run(
+            ["zellij", "delete-session", session, "--force"],
+            capture_output=True,
+            text=True,
+        )
+        state = None
+
+    if state is None:
+        if not attach_headless(session, cols, rows):
+            raise SystemExit(f"could not create zellij session {session!r}")
+        return {"session": session, "action": "created"}
+
+    if not has_client(session):
+        # Alive but unattached: 50x50, so guests would be unreadable.
+        attach_headless(session, cols, rows)
+        return {"session": session, "action": "resized"}
+
+    return {"session": session, "action": "existing"}
+
+
+def require_session(session):
+    """Fail loudly rather than acting on the wrong session."""
+    if not session:
+        return
+    if list_sessions().get(session) != "live":
+        raise SystemExit(
+            f"zellij session {session!r} is not running; "
+            f"run `zagent.py spawn` first"
+        )
+
+
 def term(pane):
     """Accept 6 or terminal_6; zellij wants terminal_6, agentbus stores 6."""
     p = str(pane)
@@ -94,13 +203,27 @@ def load_snapshot():
         return {"sessions": []}
 
 
+def location_of(s):
+    """Where a session lives, as (mux, mux_session, pane).
+
+    Current agentbus publishes `location: {mux, session, pane}`. Older versions
+    published `pane: {zellij_session, pane_id}` and assumed zellij. Both are read
+    so the skill works either side of that change.
+    """
+    loc = s.get("location")
+    if isinstance(loc, dict):
+        return loc.get("mux", ""), loc.get("session", ""), loc.get("pane", "")
+    old = s.get("pane") or {}
+    return "zellij", old.get("zellij_session", ""), old.get("pane_id", "")
+
+
 def find_session(zsession, pane):
     """Map a pane to the agentbus session living in it, or None."""
     for s in load_snapshot().get("sessions", []):
-        p = s.get("pane", {})
-        if p.get("pane_id") == bare(pane) and (
-            not zsession or p.get("zellij_session") == zsession
-        ):
+        mux, mux_session, pane_id = location_of(s)
+        if mux and mux != "zellij":
+            continue
+        if pane_id == bare(pane) and (not zsession or mux_session == zsession):
             return s
     return None
 
@@ -177,6 +300,7 @@ def spawn(args):
     spec = AGENTS.get(args.agent)
     if not spec and not args.cmd:
         raise SystemExit(f"unknown agent {args.agent!r}; pass --cmd")
+    setup = ensure_session(args.session, args.cols, args.rows)
     inner = args.cmd or spec["cmd"]
     if args.args:
         inner += " " + " ".join(f"'{a}'" for a in args.args)
@@ -185,18 +309,69 @@ def spawn(args):
     # so it does not inherit the orchestrator's agent identity.
     launch = ["/bin/bash", "-lc", f"exec env {scrub} {inner}"]
 
-    cmd = ["new-pane", "--name", args.name or f"guest-{args.agent}"]
-    if args.cwd:
-        cmd += ["--cwd", os.path.abspath(args.cwd)]
-    if args.floating:
-        cmd.append("--floating")
-    cmd += ["--", *launch]
-    pane = zj(args.session, *cmd, check=True).splitlines()[-1].strip()
-    if not pane.startswith("terminal_"):
-        raise SystemExit(f"unexpected new-pane output: {pane!r}")
+    name = args.name or f"guest-{args.agent}"
+    cwd = [os.path.abspath(args.cwd)] if args.cwd else []
+
+    if args.floating or args.split:
+        # Splitting divides the session between guests: four of them get a
+        # quarter of the width each, and TUIs reflow into soup. Deliberate
+        # choice only.
+        cmd = ["new-pane", "--name", name]
+        if cwd:
+            cmd += ["--cwd", cwd[0]]
+        if args.floating:
+            cmd.append("--floating")
+        pane = zj(args.session, *cmd, "--", *launch, check=True)
+        pane = pane.splitlines()[-1].strip()
+    else:
+        # One tab per guest: every guest keeps the full session geometry no
+        # matter how many are running.
+        cmd = ["new-tab", "--name", name]
+        if cwd:
+            cmd += ["--cwd", cwd[0]]
+        tab = zj(args.session, *cmd, "--", *launch, check=True)
+        tab = tab.splitlines()[-1].strip()
+        pane = pane_in_tab(args.session, tab)
+
+    if not pane or not pane.startswith("terminal_"):
+        raise SystemExit(f"could not determine new pane id (got {pane!r})")
 
     ready = wait_ready(args.session, pane, args.ready_timeout)
-    print(json.dumps({"pane": pane, "bare": bare(pane), "ready": ready}))
+    print(
+        json.dumps(
+            {
+                "pane": pane,
+                "bare": bare(pane),
+                "ready": ready,
+                "session": args.session or "(current)",
+                "session_action": setup["action"],
+            }
+        )
+    )
+
+
+def pane_in_tab(session, tab_id, timeout=10.0):
+    """The terminal pane of a freshly created tab.
+
+    new-tab returns a tab id, not a pane id, so the pane has to be looked up.
+    The tab's plugin panes (tab-bar, status-bar) are skipped.
+
+    Parsed from JSON, not the table: tab names contain spaces ("Tab #1"), so
+    splitting the table on whitespace misaligns every column after it.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            panes = json.loads(zj(session, "list-panes", "-j"))
+        except Exception:
+            panes = []
+        for p in panes:
+            if p.get("is_plugin") or p.get("is_floating"):
+                continue
+            if str(p.get("tab_id")) == str(tab_id):
+                return f"terminal_{p['id']}"
+        time.sleep(0.3)
+    return None
 
 
 TRUST_MARKERS = (
@@ -247,6 +422,7 @@ def submit(zsession, pane):
 
 
 def send(args):
+    require_session(args.session)
     text = args.text if args.text != "-" else sys.stdin.read()
     paste(args.session, term(args.pane), text)
     if not args.no_submit:
@@ -340,11 +516,13 @@ def tail_screen(zsession, pane, lines=40):
 
 
 def cmd_wait(args):
+    require_session(args.session)
     r = wait_turn(args.session, term(args.pane), 0, args.timeout, uptake=1e9)
     print(json.dumps(r, indent=2))
 
 
 def cmd_ask(args):
+    require_session(args.session)
     text = args.text if args.text != "-" else sys.stdin.read()
     pane = term(args.pane)
     paste(args.session, pane, text)
@@ -360,19 +538,27 @@ def cmd_ask(args):
 
 
 def cmd_read(args):
+    require_session(args.session)
     print(tail_screen(args.session, args.pane, args.lines))
 
 
 def cmd_status(args):
     rows = []
     for s in load_snapshot().get("sessions", []):
-        p = s.get("pane", {})
+        mux, mux_session, pane_id = location_of(s)
+        # Default to the session being orchestrated; the machine-wide view is
+        # noisy and mostly other people's work.
+        if not args.all and args.session and mux_session != args.session:
+            continue
         rows.append(
             {
-                "session": s["session"][:8],
+                # Full id, not a prefix: Codex session ids are UUIDv7, so their
+                # leading characters are a shared timestamp and two concurrent
+                # agents look identical when truncated.
+                "session": s["session"],
                 "source": s.get("source"),
                 "state": s.get("state"),
-                "pane": f"{p.get('zellij_session','')}/{p.get('pane_id','')}",
+                "pane": f"{mux_session}/{pane_id}",
                 "cwd": s.get("cwd", ""),
                 "label": s.get("label", "")[:60],
             }
@@ -381,6 +567,7 @@ def cmd_status(args):
 
 
 def cmd_kill(args):
+    require_session(args.session)
     pane = term(args.pane)
     agent = args.agent
     spec = AGENTS.get(agent, {})
@@ -397,8 +584,11 @@ def cmd_kill(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--session", "-s", default=os.environ.get("ZAGENT_SESSION"),
-                    help="zellij session (default: current)")
+    ap.add_argument(
+        "--session", "-s", default=DEFAULT_SESSION,
+        help=f"zellij session for guests, created on demand "
+             f"(default: {DEFAULT_SESSION!r}; '' means the current session)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("spawn")
@@ -406,8 +596,16 @@ def main():
     p.add_argument("--cmd", help="override the launch command")
     p.add_argument("--cwd")
     p.add_argument("--name")
-    p.add_argument("--floating", action="store_true")
+    p.add_argument("--floating", action="store_true",
+                   help="floating pane; polite when targeting a session a "
+                        "human is using")
+    p.add_argument("--split", action="store_true",
+                   help="split the current tab instead of opening a new one; "
+                        "shrinks every guest as more are added")
     p.add_argument("--ready-timeout", type=float, default=45.0)
+    p.add_argument("--cols", type=int, default=DEFAULT_COLS,
+                   help="width for a newly created session")
+    p.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     p.add_argument("args", nargs="*")
     p.set_defaults(func=spawn)
 
@@ -434,6 +632,8 @@ def main():
     p.set_defaults(func=cmd_read)
 
     p = sub.add_parser("status")
+    p.add_argument("--all", action="store_true",
+                   help="every agent on the machine, not just this session")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("kill")
